@@ -1,0 +1,25 @@
+# Git Ignore Configuration for VoxShield Project
+
+# Ignore large datasets
+Dataset/
+Dataset/LA/
+Dataset/ASVspoof2021_LA_eval/
+
+# Ignore compiled python files
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore PyTorch checkpoints and training outputs
+VoxShield_Development/checkpoints/
+*.pt
+*.pth
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Ignore local system files
+.DS_Store
+Thumbs.db
