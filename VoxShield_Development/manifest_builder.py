@@ -33,37 +33,40 @@ def find_subfolder(parent, prefix):
 
 def download_and_extract_2021_keys():
     """Downloads and extracts the official 2021 evaluation keys if they are not present."""
-    target_dir = config.DATASET_2021_DIR
+    # On Google Colab, use a local fast directory to avoid Google Drive FUSE write slowness/hangs
+    if os.path.exists('/content'):
+        target_dir = "/content/temp_keys"
+    else:
+        target_dir = config.DATASET_2021_DIR
+        
     os.makedirs(target_dir, exist_ok=True)
     
-    # Try recursively searching for trial_metadata.txt or similar, prioritizing CM folder
+    # Try recursively searching in target_dir or the config dataset directory
     metadata_path = None
-    candidates = []
-    for root, dirs, files in os.walk(target_dir):
-        for f in files:
-            if "trial_metadata" in f and f.endswith(".txt"):
-                full_p = os.path.join(root, f)
-                normalized_p = full_p.replace('\\', '/')
-                if "la/cm" in normalized_p.lower():
-                    metadata_path = full_p
-                    break
-                candidates.append(full_p)
-        if metadata_path:
-            break
-            
-    if not metadata_path and candidates:
-        metadata_path = candidates[0]
-            
-    if metadata_path:
-        print(f"[Info] Found ASVspoof 2021 keys at: {metadata_path}")
-        return metadata_path
-        
+    for search_dir in [target_dir, config.DATASET_2021_DIR]:
+        if os.path.exists(search_dir):
+            for root, dirs, files in os.walk(search_dir):
+                for f in files:
+                    if "trial_metadata" in f and f.endswith(".txt"):
+                        full_p = os.path.join(root, f)
+                        normalized_p = full_p.replace('\\', '/')
+                        if "la/cm" in normalized_p.lower():
+                            print(f"[Info] Found ASVspoof 2021 keys at: {full_p}")
+                            return full_p
+                            
     tar_path = os.path.join(target_dir, "LA-keys-full.tar.gz")
     if not os.path.exists(tar_path):
         url = "https://www.asvspoof.org/asvspoof2021/LA-keys-full.tar.gz"
         print(f"[Info] Downloading ASVspoof 2021 keys from: {url}")
-        urllib.request.urlretrieve(url, tar_path)
-        print("[Info] Download complete.")
+        try:
+            import socket
+            socket.setdefaulttimeout(30)
+            urllib.request.urlretrieve(url, tar_path)
+            print("[Info] Download complete via urllib.")
+        except Exception as e:
+            print(f"[Warning] Download failed via urllib ({e}). Trying wget fallback...")
+            os.system(f"wget -q -O \"{tar_path}\" {url}")
+            print("[Info] Download complete via wget.")
         
     print(f"[Info] Extracting keys from {tar_path}...")
     with tarfile.open(tar_path, "r:gz") as tar:
