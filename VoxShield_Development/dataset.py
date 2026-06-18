@@ -46,8 +46,29 @@ class ASVspoofDataset(Dataset):
 
     def _process_audio(self, filepath):
         """Loads, resamples, normalizes, and crops/pads the waveform."""
-        # Load waveform
-        waveform, sr = torchaudio.load(filepath)
+        # Load waveform with fallback if backend is missing
+        try:
+            waveform, sr = torchaudio.load(filepath)
+        except Exception as e:
+            try:
+                import soundfile as sf
+                data, sr = sf.read(filepath)
+                # If stereo/multichannel, soundfile returns shape [T_samples, Channels]
+                # transpose/reshape to [Channels, T_samples]
+                if len(data.shape) > 1:
+                    # transpose
+                    data = data.T
+                    # take mean if multichannel
+                    waveform = torch.tensor(data, dtype=torch.float32)
+                else:
+                    waveform = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+            except Exception as sf_err:
+                try:
+                    import librosa
+                    data, sr = librosa.load(filepath, sr=None)
+                    waveform = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+                except Exception as lib_err:
+                    raise e
         
         # Convert stereo/multichannel to mono
         if waveform.shape[0] > 1:
@@ -84,12 +105,62 @@ class ASVspoofDataset(Dataset):
         
         return waveform
 
+    def _translate_filepath(self, filepath, row):
+        """Translates the manifest file path to the current environment path if needed."""
+        # Clean path separators
+        filepath = filepath.replace('\\', '/')
+        
+        # If the file exists directly, use it
+        if os.path.exists(filepath):
+            return filepath
+            
+        # Get dataset and split details
+        dataset = row.get("dataset", "ASVspoof2019_LA")
+        split = row.get("split", "train")
+        utt_id = row.get("utt_id")
+        
+        # Re-resolve path based on the dataset
+        if dataset == "ASVspoof2021_LA":
+            # For 2021 eval, the audio folder is flac (or flac (1)) inside DATASET_2021_DIR
+            flac_dir_name = "flac"
+            if os.path.exists(config.DATASET_2021_DIR):
+                for d in os.listdir(config.DATASET_2021_DIR):
+                    if d.lower().startswith("flac") and os.path.isdir(os.path.join(config.DATASET_2021_DIR, d)):
+                        flac_dir_name = d
+                        break
+            new_path = os.path.join(config.DATASET_2021_DIR, flac_dir_name, f"{utt_id}.flac")
+            if os.path.exists(new_path):
+                return new_path
+                
+        else:
+            # For 2019 train, dev, eval
+            audio_subfolder = f"ASVspoof2019_LA_{split}"
+            split_folder = self._find_subfolder(config.DATASET_LA_DIR, audio_subfolder)
+            flac_folder = self._find_subfolder(split_folder, "flac")
+            new_path = os.path.join(flac_folder, f"{utt_id}.flac")
+            if os.path.exists(new_path):
+                return new_path
+                
+        # If re-resolution failed but we modified the separator, try it as fallback
+        return filepath
+
+    def _find_subfolder(self, parent, prefix):
+        if not os.path.exists(parent):
+            return os.path.join(parent, prefix)
+        for d in os.listdir(parent):
+            if prefix.lower() in d.lower() and os.path.isdir(os.path.join(parent, d)):
+                return os.path.join(parent, d)
+        return os.path.join(parent, prefix)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         filepath = row["filepath"]
         utt_id = row["utt_id"]
         label_str = row["label"]
         label = self.label_map[label_str]
+        
+        # Dynamically translate the filepath if running on Colab or if the path is mismatched
+        filepath = self._translate_filepath(filepath, row)
         
         # Load and preprocess raw waveform
         try:

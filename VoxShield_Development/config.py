@@ -11,15 +11,107 @@ To review configurations or import:
 
 import os
 
+# Get the directory of config.py (VoxShield_Development)
+BASE_DEV_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def find_dataset_la():
+    # 1. Check local environment absolute path
+    local_path = r"d:\Project Work phase 1\VoxShield\Dataset\LA"
+    if os.path.exists(local_path):
+        return local_path
+        
+    # 2. Check relative to code location (e.g., inside Dataset/LA)
+    relative_path_1 = os.path.abspath(os.path.join(BASE_DEV_DIR, "..", "Dataset", "LA"))
+    if os.path.exists(relative_path_1):
+        return relative_path_1
+        
+    # 3. Check if LA is direct sibling of VoxShield_Development
+    relative_path_2 = os.path.abspath(os.path.join(BASE_DEV_DIR, "..", "LA"))
+    if os.path.exists(relative_path_2):
+        return relative_path_2
+        
+    # 4. Search in Google Drive mounts
+    drive_prefixes = [
+        "/content/drive/MyDrive",
+        "/content/drive/Shareddrives",
+    ]
+    for prefix in drive_prefixes:
+        if os.path.exists(prefix):
+            for root, dirs, files in os.walk(prefix):
+                depth = root.replace(prefix, "").count(os.sep)
+                if depth > 3:
+                    continue
+                for d in dirs:
+                    if d.lower() == "la":
+                        la_candidate = os.path.join(root, d)
+                        # Ensure it contains protocols
+                        if os.path.exists(os.path.join(la_candidate, "ASVspoof2019_LA_cm_protocols")):
+                            return la_candidate
+                        # Check also case-insensitive protocol folders
+                        for subd in os.listdir(la_candidate):
+                            if "protocol" in subd.lower():
+                                return la_candidate
+                            
+    return local_path
+
+def find_dataset_2021():
+    # 1. Check local environment absolute path
+    local_path = r"d:\Project Work phase 1\VoxShield\Dataset\ASVspoof2021_LA_eval\ASVspoof2021_LA_eval"
+    if os.path.exists(local_path):
+        return local_path
+        
+    # 2. Check relative to code location (nested ASVspoof2021_LA_eval)
+    relative_path_1 = os.path.abspath(os.path.join(BASE_DEV_DIR, "..", "Dataset", "ASVspoof2021_LA_eval", "ASVspoof2021_LA_eval"))
+    if os.path.exists(relative_path_1):
+        return relative_path_1
+        
+    # 3. Check sibling with or without suffixes
+    parent_dir = os.path.abspath(os.path.join(BASE_DEV_DIR, ".."))
+    dataset_dir = os.path.join(parent_dir, "Dataset")
+    search_dirs = [parent_dir]
+    if os.path.exists(dataset_dir):
+        search_dirs.append(dataset_dir)
+        
+    for s_dir in search_dirs:
+        if os.path.exists(s_dir):
+            for item in os.listdir(s_dir):
+                if "ASVspoof2021_LA_eval" in item:
+                    candidate = os.path.join(s_dir, item)
+                    if os.path.isdir(candidate):
+                        nested_candidate = os.path.join(candidate, "ASVspoof2021_LA_eval")
+                        if os.path.exists(nested_candidate):
+                            return nested_candidate
+                        return candidate
+                    
+    # 4. Search in Google Drive mounts
+    drive_prefixes = [
+        "/content/drive/MyDrive",
+        "/content/drive/Shareddrives",
+    ]
+    for prefix in drive_prefixes:
+        if os.path.exists(prefix):
+            for root, dirs, files in os.walk(prefix):
+                depth = root.replace(prefix, "").count(os.sep)
+                if depth > 3:
+                    continue
+                for d in dirs:
+                    if "ASVspoof2021_LA_eval" in d:
+                        candidate = os.path.join(root, d)
+                        nested_candidate = os.path.join(candidate, "ASVspoof2021_LA_eval")
+                        if os.path.exists(nested_candidate):
+                            return nested_candidate
+                        return candidate
+                        
+    return local_path
+
 # ==============================================================================
 # 1. Directory and Dataset Paths
 # ==============================================================================
-# Absolute paths to raw datasets
-DATASET_LA_DIR = r"d:\Project Work phase 1\VoxShield\Dataset\LA"
-DATASET_2021_DIR = r"d:\Project Work phase 1\VoxShield\Dataset\ASVspoof2021_LA_eval\ASVspoof2021_LA_eval"
+# Absolute paths to raw datasets resolved dynamically
+DATASET_LA_DIR = find_dataset_la()
+DATASET_2021_DIR = find_dataset_2021()
 
 # Path to save generated manifest files and checkpoints
-BASE_DEV_DIR = r"d:\Project Work phase 1\VoxShield\VoxShield_Development"
 MANIFEST_DIR = os.path.join(BASE_DEV_DIR, "manifests")
 CHECKPOINT_DIR = os.path.join(BASE_DEV_DIR, "checkpoints")
 

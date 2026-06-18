@@ -23,13 +23,38 @@ import config
 # Disable SSL verification for urllib (necessary for some local environments)
 ssl._create_default_https_context = ssl._create_unverified_context
 
+def find_subfolder(parent, prefix):
+    if not os.path.exists(parent):
+        return os.path.join(parent, prefix)
+    for d in os.listdir(parent):
+        if prefix.lower() in d.lower() and os.path.isdir(os.path.join(parent, d)):
+            return os.path.join(parent, d)
+    return os.path.join(parent, prefix)
+
 def download_and_extract_2021_keys():
     """Downloads and extracts the official 2021 evaluation keys if they are not present."""
     target_dir = config.DATASET_2021_DIR
     os.makedirs(target_dir, exist_ok=True)
     
-    metadata_path = os.path.join(target_dir, "keys", "LA", "CM", "trial_metadata.txt")
-    if os.path.exists(metadata_path):
+    # Try recursively searching for trial_metadata.txt or similar, prioritizing CM folder
+    metadata_path = None
+    candidates = []
+    for root, dirs, files in os.walk(target_dir):
+        for f in files:
+            if "trial_metadata" in f and f.endswith(".txt"):
+                full_p = os.path.join(root, f)
+                normalized_p = full_p.replace('\\', '/')
+                if "la/cm" in normalized_p.lower():
+                    metadata_path = full_p
+                    break
+                candidates.append(full_p)
+        if metadata_path:
+            break
+            
+    if not metadata_path and candidates:
+        metadata_path = candidates[0]
+            
+    if metadata_path:
         print(f"[Info] Found ASVspoof 2021 keys at: {metadata_path}")
         return metadata_path
         
@@ -45,21 +70,25 @@ def download_and_extract_2021_keys():
         tar.extractall(path=target_dir)
     print("[Info] Extraction complete.")
     
-    # Check if we can locate the metadata file now
-    # The extraction might create a folder named `keys` inside target_dir
-    possible_paths = [
-        os.path.join(target_dir, "keys", "LA", "CM", "trial_metadata.txt"),
-        os.path.join(target_dir, "keys", "trial_metadata.txt"),
-    ]
-    for p in possible_paths:
-        if os.path.exists(p):
-            return p
+    # Check if we can locate the metadata file now, prioritizing CM
+    candidates_after = []
+    for root, dirs, files in os.walk(target_dir):
+        for f in files:
+            if "trial_metadata" in f and f.endswith(".txt"):
+                full_p = os.path.join(root, f)
+                normalized_p = full_p.replace('\\', '/')
+                if "la/cm" in normalized_p.lower():
+                    return full_p
+                candidates_after.append(full_p)
+                
+    if candidates_after:
+        return candidates_after[0]
             
     raise FileNotFoundError("Could not find trial_metadata.txt in the extracted archive.")
 
 def build_2019_manifests():
     """Parses ASVspoof 2019 train, dev, and eval protocols and saves manifest CSVs."""
-    protocols_dir = os.path.join(config.DATASET_LA_DIR, "ASVspoof2019_LA_cm_protocols")
+    protocols_dir = find_subfolder(config.DATASET_LA_DIR, "ASVspoof2019_LA_cm_protocols")
     
     splits = {
         "train": {
@@ -80,7 +109,16 @@ def build_2019_manifests():
     }
     
     for split_name, info in splits.items():
-        proto_path = os.path.join(protocols_dir, info["protocol_file"])
+        # Find exact protocol filename (e.g. if it has a (1) or similar suffix)
+        proto_file_actual = info["protocol_file"]
+        if os.path.exists(protocols_dir):
+            base_prefix = os.path.splitext(info["protocol_file"])[0]
+            for f in os.listdir(protocols_dir):
+                if base_prefix.lower() in f.lower() and f.endswith(".txt"):
+                    proto_file_actual = f
+                    break
+                    
+        proto_path = os.path.join(protocols_dir, proto_file_actual)
         if not os.path.exists(proto_path):
             print(f"[Warning] Protocol file {proto_path} not found. Skipping 2019 {split_name} split.")
             continue
@@ -96,13 +134,10 @@ def build_2019_manifests():
                     attack_id = parts[3]
                     label = parts[4]  # 'bonafide' or 'spoof'
                     
-                    # Construct expected audio file path
-                    filepath = os.path.join(
-                        config.DATASET_LA_DIR, 
-                        info["audio_subfolder"], 
-                        "flac", 
-                        f"{utt_id}.flac"
-                    )
+                    # Construct expected audio file path dynamically to tolerate suffix names
+                    split_folder = find_subfolder(config.DATASET_LA_DIR, info["audio_subfolder"])
+                    flac_folder = find_subfolder(split_folder, "flac")
+                    filepath = os.path.join(flac_folder, f"{utt_id}.flac")
                     
                     records.append({
                         "utt_id": utt_id,
@@ -120,7 +155,16 @@ def build_2019_manifests():
 
 def build_2021_manifest():
     """Parses ASVspoof 2021 evaluation keys and saves eval manifest CSV."""
-    trl_file = os.path.join(config.DATASET_2021_DIR, "ASVspoof2021.LA.cm.eval.trl.txt")
+    trl_file = None
+    if os.path.exists(config.DATASET_2021_DIR):
+        for f in os.listdir(config.DATASET_2021_DIR):
+            if "ASVspoof2021.LA.cm.eval.trl" in f and f.endswith(".txt"):
+                trl_file = os.path.join(config.DATASET_2021_DIR, f)
+                break
+                
+    if not trl_file:
+        trl_file = os.path.join(config.DATASET_2021_DIR, "ASVspoof2021.LA.cm.eval.trl.txt")
+        
     if not os.path.exists(trl_file):
         print(f"[Warning] 2021 trial list {trl_file} not found. Skipping 2021 split.")
         return
@@ -145,9 +189,17 @@ def build_2021_manifest():
     # Filter metadata to keep only relevant evaluation trials
     filtered_df = meta_df[meta_df["utt_id"].isin(eval_trials)].copy()
     
+    # Find exact flac folder (e.g. flac or flac (1))
+    flac_dir_name = "flac"
+    if os.path.exists(config.DATASET_2021_DIR):
+        for d in os.listdir(config.DATASET_2021_DIR):
+            if d.lower().startswith("flac") and os.path.isdir(os.path.join(config.DATASET_2021_DIR, d)):
+                flac_dir_name = d
+                break
+                
     # Construct expected file paths
     filtered_df["filepath"] = filtered_df["utt_id"].apply(
-        lambda x: os.path.join(config.DATASET_2021_DIR, "flac", f"{x}.flac")
+        lambda x: os.path.join(config.DATASET_2021_DIR, flac_dir_name, f"{x}.flac")
     )
     filtered_df["split"] = "eval"
     filtered_df["dataset"] = "ASVspoof2021_LA"
