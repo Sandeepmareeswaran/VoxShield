@@ -183,7 +183,7 @@ NUM_CLASSES = 2             # [bonafide, spoof]
 # 5. Training Strategy parameters
 # ==============================================================================
 SEED = 42
-BATCH_SIZE = 2
+BATCH_SIZE = 32
 EPOCHS = 12                 # Total training epochs (e.g. Stage 1 + Stage 2)
 LR = 1e-4                   # General learning rate for new parameters
 WEIGHT_DECAY = 1e-4

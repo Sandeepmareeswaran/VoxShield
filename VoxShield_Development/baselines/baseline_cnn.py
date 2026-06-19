@@ -24,6 +24,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import config
 from dataset import ASVspoofDataset
 from evaluate import compute_eer
+from features import FeatureExtractor
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,21 +76,34 @@ class SimpleCNNClassifier(nn.Module):
         logits = self.fc(flattened)
         return logits
 
-def train_one_epoch(model, dataloader, optimizer, criterion):
+def train_one_epoch(model, dataloader, feature_extractor, optimizer, criterion):
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
     
-    for batch_idx, (_, feats, labels, _) in enumerate(dataloader):
-        feats = feats.to(device)
+    # Initialize PyTorch GradScaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler()
+    
+    for batch_idx, (waveforms, _, labels, _) in enumerate(dataloader):
+        waveforms = waveforms.to(device)
         labels = labels.to(device)
         
+        # GPU spectral feature extraction
+        with torch.no_grad():
+            feats = feature_extractor(waveforms)
+            
         optimizer.zero_grad()
-        logits = model(feats)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
+        
+        # Runs forward pass under Autocast
+        with torch.cuda.amp.autocast():
+            logits = model(feats)
+            loss = criterion(logits, labels)
+            
+        # Scales the loss and performs backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
         total_loss += loss.item()
         _, predicted = logits.max(1)
@@ -101,15 +115,19 @@ def train_one_epoch(model, dataloader, optimizer, criterion):
             
     return total_loss / len(dataloader), correct / total
 
-def evaluate_model(model, dataloader):
+def evaluate_model(model, dataloader, feature_extractor):
     model.eval()
     all_scores = []
     all_labels = []
     
     with torch.no_grad():
-        for _, feats, labels, _ in dataloader:
-            feats = feats.to(device)
-            logits = model(feats)
+        for waveforms, _, labels, _ in dataloader:
+            waveforms = waveforms.to(device)
+            # GPU spectral feature extraction
+            feats = feature_extractor(waveforms)
+            
+            with torch.cuda.amp.autocast():
+                logits = model(feats)
             
             # Score represents probability of "bonafide" (class 0)
             probs = torch.softmax(logits, dim=1)
@@ -132,15 +150,30 @@ def main():
     
     # 1. Create Datasets and Dataloaders
     print("[Info] Loading datasets...")
-    train_dataset = ASVspoofDataset(config.TRAIN_2019_CSV)
-    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV)
+    train_dataset = ASVspoofDataset(config.TRAIN_2019_CSV, return_feats=False)
+    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV, return_feats=False)
     
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=2)
-    dev_loader = DataLoader(dev_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    dev_loader = DataLoader(
+        dev_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
-    # 2. Instantiate Model, Optimizer, Criterion
-    print(f"[Info] Initializing Baseline B model (2D CNN processing {config.FEATURE_TYPE.upper()})...")
+    # 2. Instantiate Model, Feature Extractor, Optimizer, Criterion
+    print(f"[Info] Initializing Baseline B model (2D CNN processing {config.FEATURE_TYPE.upper()}) & GPU feature extractor...")
     model = SimpleCNNClassifier().to(device)
+    feature_extractor = FeatureExtractor(config.FEATURE_TYPE).to(device)
     
     # Trigger model dry-run to instantiate lazy fc layer
     dummy_input = torch.randn(1, 1, 20 if config.FEATURE_TYPE == "lfcc" else 80, 401).to(device)
@@ -156,11 +189,11 @@ def main():
     print(f"[Info] Starting training for {config.EPOCHS} epochs...")
     for epoch in range(1, config.EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{config.EPOCHS} ---")
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion)
+        train_loss, train_acc = train_one_epoch(model, train_loader, feature_extractor, optimizer, criterion)
         print(f"Epoch {epoch} Training Summary | Loss: {train_loss:.4f} | Acc: {100. * train_acc:.2f}%")
         
         print("[Info] Running evaluation on dev set...")
-        eer, threshold = evaluate_model(model, dev_loader)
+        eer, threshold = evaluate_model(model, dev_loader, feature_extractor)
         print(f"Epoch {epoch} Evaluation Summary | Dev EER: {eer:.4f}% | Decision Threshold: {threshold:.6f}")
         
         # Save best model

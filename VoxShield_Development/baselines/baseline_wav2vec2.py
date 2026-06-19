@@ -71,15 +71,24 @@ def train_one_epoch(model, dataloader, optimizer, criterion):
     correct = 0
     total = 0
     
+    # Initialize PyTorch GradScaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler()
+    
     for batch_idx, (waveforms, _, labels, _) in enumerate(dataloader):
         waveforms = waveforms.to(device)
         labels = labels.to(device)
         
         optimizer.zero_grad()
-        logits = model(waveforms)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
+        
+        # Runs forward pass under Autocast
+        with torch.cuda.amp.autocast():
+            logits = model(waveforms)
+            loss = criterion(logits, labels)
+            
+        # Scales the loss and performs backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
         total_loss += loss.item()
         _, predicted = logits.max(1)
@@ -99,10 +108,11 @@ def evaluate_model(model, dataloader):
     with torch.no_grad():
         for waveforms, _, labels, _ in dataloader:
             waveforms = waveforms.to(device)
-            logits = model(waveforms)
+            
+            with torch.cuda.amp.autocast():
+                logits = model(waveforms)
             
             # Score represents probability of "bonafide" (class 0)
-            # High score means more likely real, low score means more likely spoof (fake)
             probs = torch.softmax(logits, dim=1)
             bonafide_probs = probs[:, 0].cpu().numpy()
             
@@ -124,11 +134,25 @@ def main():
     
     # 1. Create Datasets and Dataloaders
     print("[Info] Loading datasets...")
-    train_dataset = ASVspoofDataset(config.TRAIN_2019_CSV)
-    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV)
+    train_dataset = ASVspoofDataset(config.TRAIN_2019_CSV, return_feats=False)
+    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV, return_feats=False)
     
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=2)
-    dev_loader = DataLoader(dev_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    dev_loader = DataLoader(
+        dev_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
     # 2. Instantiate Model, Optimizer, Criterion
     print("[Info] Initializing Baseline A model (Frozen wav2vec2)...")

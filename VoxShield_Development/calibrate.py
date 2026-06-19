@@ -21,12 +21,13 @@ import numpy as np
 
 import config
 from dataset import ASVspoofDataset
+from features import FeatureExtractor
 from models.voxshield import VoxShield
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def get_validation_logits_and_labels(model, dataloader):
+def get_validation_logits_and_labels(model, dataloader, feature_extractor):
     """Gathers raw logits and labels from the validation dataset."""
     model.eval()
     all_logits = []
@@ -34,11 +35,14 @@ def get_validation_logits_and_labels(model, dataloader):
     
     print("[Info] Forwarding validation set through the model to gather logits...")
     with torch.no_grad():
-        for waveforms, spec_feats, labels, _ in dataloader:
+        for waveforms, _, labels, _ in dataloader:
             waveforms = waveforms.to(device)
-            spec_feats = spec_feats.to(device)
-            # Use frozen-ssl mode for inference validation
-            logits = model(waveforms, spec_feats, freeze_ssl=True)
+            # GPU spectral feature extraction
+            spec_feats = feature_extractor(waveforms)
+            
+            # Use frozen-ssl mode for inference validation under Autocast
+            with torch.cuda.amp.autocast():
+                logits = model(waveforms, spec_feats, freeze_ssl=True)
             
             all_logits.append(logits.cpu())
             all_labels.append(labels)
@@ -90,16 +94,24 @@ def main():
         
     # 1. Load Validation Data
     print("[Info] Loading validation set...")
-    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV)
-    dev_loader = DataLoader(dev_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV, return_feats=False)
+    dev_loader = DataLoader(
+        dev_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
-    # 2. Load Model
-    print("[Info] Loading trained VoxShield model checkpoint...")
+    # 2. Load Model and Feature Extractor
+    print("[Info] Loading trained VoxShield model checkpoint & GPU feature extractor...")
     model = VoxShield().to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    feature_extractor = FeatureExtractor(config.FEATURE_TYPE).to(device)
     
     # 3. Gather Logits
-    logits, labels = get_validation_logits_and_labels(model, dev_loader)
+    logits, labels = get_validation_logits_and_labels(model, dev_loader, feature_extractor)
     
     # 4. Calibrate
     # Move to GPU/CPU of choices

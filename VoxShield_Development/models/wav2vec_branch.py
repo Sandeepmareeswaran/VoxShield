@@ -20,6 +20,10 @@ class Wav2VecBranch(nn.Module):
         # Load pre-trained wav2vec2 model
         self.wav2vec = Wav2Vec2Model.from_pretrained(model_name)
         
+        # Freeze all wav2vec parameters by default!
+        for param in self.wav2vec.parameters():
+            param.requires_grad = False
+            
         # Linear projection layer: 768 dimensions of wav2vec-base -> shared dimension D
         self.projection = nn.Sequential(
             nn.Linear(768, shared_dim),

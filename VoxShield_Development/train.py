@@ -24,6 +24,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import config
 from dataset import ASVspoofDataset
 from evaluate import compute_eer
+from features import FeatureExtractor
 from models.voxshield import VoxShield
 
 # Set device
@@ -78,7 +79,7 @@ def get_optimizer(model, stage=1):
         
     return optimizer
 
-def train_one_epoch(model, dataloader, optimizer, criterion, freeze_ssl=True):
+def train_one_epoch(model, dataloader, feature_extractor, optimizer, criterion, freeze_ssl=True):
     model.train()
     if freeze_ssl:
         model.wav2vec_branch.wav2vec.eval()  # Keep wav2vec batchnorm/dropout frozen
@@ -90,11 +91,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion, freeze_ssl=True):
     # Initialize PyTorch GradScaler for mixed precision training
     scaler = torch.cuda.amp.GradScaler()
     
-    for batch_idx, (waveforms, spec_feats, labels, _) in enumerate(dataloader):
+    for batch_idx, (waveforms, _, labels, _) in enumerate(dataloader):
         waveforms = waveforms.to(device)
-        spec_feats = spec_feats.to(device)
         labels = labels.to(device)
         
+        # GPU spectral feature extraction
+        with torch.no_grad():
+            spec_feats = feature_extractor(waveforms)
+            
         optimizer.zero_grad()
         
         # Runs forward pass under Autocast
@@ -117,16 +121,19 @@ def train_one_epoch(model, dataloader, optimizer, criterion, freeze_ssl=True):
             
     return total_loss / len(dataloader), correct / total
 
-def evaluate_model(model, dataloader, freeze_ssl=True):
+def evaluate_model(model, dataloader, feature_extractor, freeze_ssl=True):
     model.eval()
     all_scores = []
     all_labels = []
     
     with torch.no_grad():
-        for waveforms, spec_feats, labels, _ in dataloader:
+        for waveforms, _, labels, _ in dataloader:
             waveforms = waveforms.to(device)
-            spec_feats = spec_feats.to(device)
-            logits = model(waveforms, spec_feats, freeze_ssl=freeze_ssl)
+            # GPU spectral feature extraction
+            spec_feats = feature_extractor(waveforms)
+            
+            with torch.cuda.amp.autocast():
+                logits = model(waveforms, spec_feats, freeze_ssl=freeze_ssl)
             
             # Score represents probability of "bonafide" (class 0)
             probs = torch.softmax(logits, dim=1)
@@ -149,15 +156,30 @@ def main():
     
     # 1. Load Data
     print("[Info] Loading datasets...")
-    train_dataset = ASVspoofDataset(config.TRAIN_2019_CSV)
-    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV)
+    train_dataset = ASVspoofDataset(config.TRAIN_2019_CSV, return_feats=False)
+    dev_dataset = ASVspoofDataset(config.DEV_2019_CSV, return_feats=False)
     
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=2)
-    dev_loader = DataLoader(dev_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    dev_loader = DataLoader(
+        dev_dataset, 
+        batch_size=config.BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
     
-    # 2. Instantiate Model
-    print("[Info] Initializing VoxShield model...")
+    # 2. Instantiate Model and Feature Extractor
+    print("[Info] Initializing VoxShield model & GPU feature extractor...")
     model = VoxShield().to(device)
+    feature_extractor = FeatureExtractor(config.FEATURE_TYPE).to(device)
     
     # 3. Setup Criterion and Optimizer (Stage 1)
     criterion = nn.CrossEntropyLoss()
@@ -190,6 +212,7 @@ def main():
         train_loss, train_acc = train_one_epoch(
             model, 
             train_loader, 
+            feature_extractor,
             optimizer, 
             criterion, 
             freeze_ssl=is_w2v_frozen
@@ -198,7 +221,7 @@ def main():
         
         # Eval
         print("[Info] Evaluating on validation set...")
-        eer, threshold = evaluate_model(model, dev_loader, freeze_ssl=is_w2v_frozen)
+        eer, threshold = evaluate_model(model, dev_loader, feature_extractor, freeze_ssl=is_w2v_frozen)
         print(f"Epoch {epoch} Evaluation Summary | Dev EER: {eer:.4f}% | Decision Threshold: {threshold:.6f}")
         
         scheduler.step()
