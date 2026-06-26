@@ -168,9 +168,36 @@ class ASVspoofDataset(Dataset):
         try:
             waveform = self._process_audio(filepath)
         except Exception as e:
-            # Fallback if audio file is corrupted or missing
-            print(f"[Warning] Failed to load {filepath}: {e}. Returning zeros.")
-            waveform = torch.zeros(self.target_length)
+            # Fallback if audio file is corrupted or missing: try loading directly from Google Drive
+            fallback_success = False
+            if filepath.startswith('/content/VoxShield/LA/'):
+                rel_path = filepath[len('/content/VoxShield/LA/'):]
+                drive_roots = [
+                    '/content/drive/MyDrive/project phase 1/LA',
+                    '/content/drive/MyDrive/Project Work phase 1/Dataset/LA',
+                    '/content/drive/MyDrive/VoxShield/Dataset/LA'
+                ]
+                for drive_root in drive_roots:
+                    drive_filepath = os.path.join(drive_root, rel_path).replace('\\', '/')
+                    if os.path.exists(drive_filepath):
+                        try:
+                            # Try processing the drive file
+                            waveform = self._process_audio(drive_filepath)
+                            fallback_success = True
+                            # Proactively repair the local corrupted/truncated file
+                            try:
+                                import shutil
+                                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                                shutil.copy2(drive_filepath, filepath)
+                                print(f"[Self-Healing] Successfully repaired local file from Drive: {filepath}")
+                            except Exception:
+                                pass
+                            break
+                        except Exception:
+                            pass
+            if not fallback_success:
+                print(f"[Warning] Failed to load {filepath}: {e}. Returning zeros.")
+                waveform = torch.zeros(self.target_length)
             
         # Extract features (LFCC or Log-Mel) from the processed waveform if requested
         # Feature shape output: [1, Features, Frames]
