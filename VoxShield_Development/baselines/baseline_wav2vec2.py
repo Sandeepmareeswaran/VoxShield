@@ -5,6 +5,9 @@ VoxShield - Baseline A: Frozen wav2vec2 + MLP Classifier (Phase 5)
 This script trains a baseline audio deepfake detector using a completely frozen
 wav2vec2-base model as an encoder, followed by average pooling and an MLP classifier.
 
+**Crash-Resilient**: Automatically saves full training state after every epoch and
+backs up to Google Drive (on Colab). On restart, resumes from the last completed epoch.
+
 To run training in Google Colab or terminal:
     python baselines/baseline_wav2vec2.py
 
@@ -14,6 +17,7 @@ Command-line usage context:
 
 import sys
 import os
+import shutil
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -30,6 +34,46 @@ from evaluate import compute_eer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[Info] Using device: {device}")
 
+# ==============================================================================
+# Google Drive backup paths (used only when running on Colab)
+# ==============================================================================
+DRIVE_CHECKPOINT_DIR = "/content/drive/MyDrive/VoxShield_Checkpoints"
+
+def backup_to_drive(local_path, filename=None):
+    """Copies a local checkpoint file to Google Drive for persistence across Colab sessions."""
+    if not os.path.exists("/content"):
+        return  # Not running on Colab, skip
+    if not os.path.exists("/content/drive"):
+        print("[Backup] Google Drive not mounted. Skipping backup.")
+        return
+    os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
+    if filename is None:
+        filename = os.path.basename(local_path)
+    dst = os.path.join(DRIVE_CHECKPOINT_DIR, filename)
+    try:
+        shutil.copy2(local_path, dst)
+        print(f"[Backup] Saved checkpoint to Google Drive: {dst}")
+    except Exception as e:
+        print(f"[Backup] Warning: Could not backup to Drive ({e}). Training continues.")
+
+def restore_from_drive(local_path, filename=None):
+    """Restores a checkpoint from Google Drive to local SSD if it exists."""
+    if not os.path.exists("/content"):
+        return  # Not on Colab
+    if filename is None:
+        filename = os.path.basename(local_path)
+    src = os.path.join(DRIVE_CHECKPOINT_DIR, filename)
+    if os.path.exists(src) and not os.path.exists(local_path):
+        try:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            shutil.copy2(src, local_path)
+            print(f"[Restore] Copied checkpoint from Google Drive: {src} → {local_path}")
+        except Exception as e:
+            print(f"[Restore] Warning: Could not restore from Drive ({e}).")
+
+# ==============================================================================
+# Model Definition
+# ==============================================================================
 class Wav2Vec2MLPClassifier(nn.Module):
     def __init__(self, wav2vec_model_name=config.WAV2VEC_MODEL, num_classes=config.NUM_CLASSES):
         super(Wav2Vec2MLPClassifier, self).__init__()
@@ -62,6 +106,9 @@ class Wav2Vec2MLPClassifier(nn.Module):
         logits = self.mlp(pooled)
         return logits
 
+# ==============================================================================
+# Training & Evaluation Functions
+# ==============================================================================
 def train_one_epoch(model, dataloader, optimizer, criterion):
     model.train()
     # Ensure wav2vec is kept in eval mode so Batch Normalization/Dropout behaves correctly
@@ -129,6 +176,46 @@ def evaluate_model(model, dataloader):
     eer, threshold = compute_eer(bonafide_scores, spoof_scores)
     return eer, threshold
 
+# ==============================================================================
+# Checkpoint Save / Load
+# ==============================================================================
+def save_training_checkpoint(epoch, model, optimizer, best_eer, resume_path):
+    """Saves the full training state so training can be resumed after a crash."""
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_eer": best_eer,
+    }
+    torch.save(checkpoint, resume_path)
+    print(f"[Checkpoint] Saved training state (epoch {epoch}) to: {resume_path}")
+    # Backup to Google Drive
+    backup_to_drive(resume_path)
+
+def load_training_checkpoint(resume_path, model, optimizer):
+    """Loads a saved training checkpoint. Returns (start_epoch, best_eer) or (1, inf) if none found."""
+    # Try restoring from Google Drive first (in case local SSD was wiped)
+    restore_from_drive(resume_path)
+    
+    if not os.path.exists(resume_path):
+        return 1, float("inf")
+    
+    try:
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1  # Resume from the NEXT epoch
+        best_eer = checkpoint["best_eer"]
+        print(f"[Resume] ✅ Loaded checkpoint from epoch {checkpoint['epoch']}. Resuming from epoch {start_epoch}.")
+        print(f"[Resume] Best EER so far: {best_eer:.4f}%")
+        return start_epoch, best_eer
+    except Exception as e:
+        print(f"[Resume] Warning: Could not load checkpoint ({e}). Starting fresh.")
+        return 1, float("inf")
+
+# ==============================================================================
+# Main
+# ==============================================================================
 def main():
     torch.manual_seed(config.SEED)
     
@@ -165,10 +252,21 @@ def main():
     
     best_eer = float("inf")
     checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "baseline_wav2vec2_best.pt")
+    resume_path = os.path.join(config.CHECKPOINT_DIR, "baseline_wav2vec2_resume.pt")
     
-    # 3. Training Loop
-    print(f"[Info] Starting training for {config.EPOCHS} epochs...")
-    for epoch in range(1, config.EPOCHS + 1):
+    # 3. Attempt to resume from a previous checkpoint
+    start_epoch, best_eer = load_training_checkpoint(resume_path, model, optimizer)
+    
+    # Also restore best model checkpoint from Drive if needed
+    restore_from_drive(checkpoint_path)
+    
+    if start_epoch > config.EPOCHS:
+        print(f"[Info] Training already completed (all {config.EPOCHS} epochs done). Nothing to do.")
+        return
+    
+    # 4. Training Loop (resumes from start_epoch)
+    print(f"[Info] Starting training for epochs {start_epoch}–{config.EPOCHS} (total {config.EPOCHS})...")
+    for epoch in range(start_epoch, config.EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{config.EPOCHS} ---")
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion)
         print(f"Epoch {epoch} Training Summary | Loss: {train_loss:.4f} | Acc: {100. * train_acc:.2f}%")
@@ -177,11 +275,15 @@ def main():
         eer, threshold = evaluate_model(model, dev_loader)
         print(f"Epoch {epoch} Evaluation Summary | Dev EER: {eer:.4f}% | Decision Threshold: {threshold:.6f}")
         
-        # Save best model
+        # Save best model (unchanged format for inference compatibility)
         if eer < best_eer:
             best_eer = eer
             torch.save(model.state_dict(), checkpoint_path)
             print(f"[Success] New best Dev EER! Saved checkpoint to: {checkpoint_path}")
+            backup_to_drive(checkpoint_path)
+        
+        # Save full training state for crash recovery (EVERY epoch)
+        save_training_checkpoint(epoch, model, optimizer, best_eer, resume_path)
             
     print(f"\n[Finished] Training complete. Best Dev EER achieved: {best_eer:.4f}%")
 

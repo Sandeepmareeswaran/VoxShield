@@ -7,6 +7,10 @@ This script executes the two-stage end-to-end training pipeline:
 - Stage 2 (Epoch FREEZE_EPOCHS+1 onwards): Unfreeze top transformer layers of wav2vec2
   and fine-tune with a low learning rate.
 
+**Crash-Resilient**: Automatically saves full training state (epoch, model, optimizer,
+scheduler, stage flag, best EER) after every epoch and backs up to Google Drive (on Colab).
+On restart, resumes from the last completed epoch with correct training stage.
+
 To run training in Google Colab or terminal:
     python train.py
 
@@ -15,6 +19,7 @@ Command-line usage context (for Colab / Local terminal):
 """
 
 import os
+import shutil
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -31,6 +36,46 @@ from models.voxshield import VoxShield
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[Info] Using device: {device}")
 
+# ==============================================================================
+# Google Drive backup paths (used only when running on Colab)
+# ==============================================================================
+DRIVE_CHECKPOINT_DIR = "/content/drive/MyDrive/VoxShield_Checkpoints"
+
+def backup_to_drive(local_path, filename=None):
+    """Copies a local checkpoint file to Google Drive for persistence across Colab sessions."""
+    if not os.path.exists("/content"):
+        return  # Not running on Colab, skip
+    if not os.path.exists("/content/drive"):
+        print("[Backup] Google Drive not mounted. Skipping backup.")
+        return
+    os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
+    if filename is None:
+        filename = os.path.basename(local_path)
+    dst = os.path.join(DRIVE_CHECKPOINT_DIR, filename)
+    try:
+        shutil.copy2(local_path, dst)
+        print(f"[Backup] Saved checkpoint to Google Drive: {dst}")
+    except Exception as e:
+        print(f"[Backup] Warning: Could not backup to Drive ({e}). Training continues.")
+
+def restore_from_drive(local_path, filename=None):
+    """Restores a checkpoint from Google Drive to local SSD if it exists."""
+    if not os.path.exists("/content"):
+        return  # Not on Colab
+    if filename is None:
+        filename = os.path.basename(local_path)
+    src = os.path.join(DRIVE_CHECKPOINT_DIR, filename)
+    if os.path.exists(src) and not os.path.exists(local_path):
+        try:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            shutil.copy2(src, local_path)
+            print(f"[Restore] Copied checkpoint from Google Drive: {src} → {local_path}")
+        except Exception as e:
+            print(f"[Restore] Warning: Could not restore from Drive ({e}).")
+
+# ==============================================================================
+# Stage Management
+# ==============================================================================
 def unfreeze_top_w2v_layers(model):
     """Unfreezes the top N transformer layers and final LayerNorm of the wav2vec2 encoder."""
     print(f"[Info] Unfreezing the top {config.UNFREEZE_LAYERS} layers of wav2vec2 backbone...")
@@ -79,6 +124,9 @@ def get_optimizer(model, stage=1):
         
     return optimizer
 
+# ==============================================================================
+# Training & Evaluation Functions
+# ==============================================================================
 def train_one_epoch(model, dataloader, feature_extractor, optimizer, criterion, freeze_ssl=True):
     model.train()
     if freeze_ssl:
@@ -151,6 +199,53 @@ def evaluate_model(model, dataloader, feature_extractor, freeze_ssl=True):
     eer, threshold = compute_eer(bonafide_scores, spoof_scores)
     return eer, threshold
 
+# ==============================================================================
+# Checkpoint Save / Load
+# ==============================================================================
+def save_training_checkpoint(epoch, model, optimizer, scheduler, best_eer, is_w2v_frozen, resume_path):
+    """Saves the full training state so training can be resumed after a crash."""
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_eer": best_eer,
+        "is_w2v_frozen": is_w2v_frozen,
+    }
+    torch.save(checkpoint, resume_path)
+    print(f"[Checkpoint] Saved training state (epoch {epoch}, stage={'frozen' if is_w2v_frozen else 'fine-tune'}) to: {resume_path}")
+    # Backup to Google Drive
+    backup_to_drive(resume_path)
+
+def load_training_checkpoint(resume_path, model):
+    """
+    Loads a saved training checkpoint.
+    Returns a dict with all state, or None if no checkpoint found.
+    
+    NOTE: Optimizer and scheduler are NOT loaded here because they need to be
+    reconstructed based on the training stage (frozen vs fine-tuning).
+    Model weights ARE loaded here.
+    """
+    # Try restoring from Google Drive first (in case local SSD was wiped)
+    restore_from_drive(resume_path)
+    
+    if not os.path.exists(resume_path):
+        return None
+    
+    try:
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(f"[Resume] ✅ Loaded checkpoint from epoch {checkpoint['epoch']}.")
+        print(f"[Resume] Best EER so far: {checkpoint['best_eer']:.4f}%")
+        print(f"[Resume] Training stage: {'Stage 1 (Frozen SSL)' if checkpoint['is_w2v_frozen'] else 'Stage 2 (Fine-tuning)'}")
+        return checkpoint
+    except Exception as e:
+        print(f"[Resume] Warning: Could not load checkpoint ({e}). Starting fresh.")
+        return None
+
+# ==============================================================================
+# Main
+# ==============================================================================
 def main():
     torch.manual_seed(config.SEED)
     
@@ -181,21 +276,56 @@ def main():
     model = VoxShield().to(device)
     feature_extractor = FeatureExtractor(config.FEATURE_TYPE).to(device)
     
-    # 3. Setup Criterion and Optimizer (Stage 1)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = get_optimizer(model, stage=1)
-    
-    # Cosine annealing scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
-    
-    best_eer = float("inf")
+    # 3. Attempt to resume from a previous checkpoint
     checkpoint_path = os.path.join(config.CHECKPOINT_DIR, "voxshield_best.pt")
+    resume_path = os.path.join(config.CHECKPOINT_DIR, "voxshield_resume.pt")
     
-    is_w2v_frozen = True
+    # Also restore best model checkpoint from Drive if needed
+    restore_from_drive(checkpoint_path)
     
-    # 4. Training loop
-    print(f"[Info] Starting end-to-end VoxShield training for {config.EPOCHS} epochs...")
-    for epoch in range(1, config.EPOCHS + 1):
+    saved_checkpoint = load_training_checkpoint(resume_path, model)
+    
+    if saved_checkpoint is not None:
+        start_epoch = saved_checkpoint["epoch"] + 1
+        best_eer = saved_checkpoint["best_eer"]
+        is_w2v_frozen = saved_checkpoint["is_w2v_frozen"]
+        
+        # Reconstruct correct training stage
+        if not is_w2v_frozen:
+            # We were in Stage 2 — need to unfreeze layers before creating optimizer
+            unfreeze_top_w2v_layers(model)
+            optimizer = get_optimizer(model, stage=2)
+            scheduler = CosineAnnealingLR(optimizer, T_max=(config.EPOCHS - config.FREEZE_EPOCHS))
+        else:
+            optimizer = get_optimizer(model, stage=1)
+            scheduler = CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
+        
+        # Restore optimizer and scheduler state
+        try:
+            optimizer.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(saved_checkpoint["scheduler_state_dict"])
+            print(f"[Resume] Optimizer and scheduler state restored successfully.")
+        except Exception as e:
+            print(f"[Resume] Warning: Could not restore optimizer/scheduler state ({e}). Using fresh optimizer.")
+        
+        print(f"[Resume] Resuming from epoch {start_epoch}.")
+    else:
+        start_epoch = 1
+        best_eer = float("inf")
+        is_w2v_frozen = True
+        optimizer = get_optimizer(model, stage=1)
+        scheduler = CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
+    
+    if start_epoch > config.EPOCHS:
+        print(f"[Info] Training already completed (all {config.EPOCHS} epochs done). Nothing to do.")
+        return
+    
+    # 4. Setup Criterion
+    criterion = nn.CrossEntropyLoss()
+    
+    # 5. Training loop (resumes from start_epoch)
+    print(f"[Info] Starting end-to-end VoxShield training for epochs {start_epoch}–{config.EPOCHS} (total {config.EPOCHS})...")
+    for epoch in range(start_epoch, config.EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{config.EPOCHS} ---")
         
         # Check if we should transit to Stage 2 (unfreeze wav2vec)
@@ -226,12 +356,16 @@ def main():
         
         scheduler.step()
         
-        # Save check point
+        # Save best model (unchanged format for inference compatibility)
         if eer < best_eer:
             best_eer = eer
             # Save complete state dict
             torch.save(model.state_dict(), checkpoint_path)
             print(f"[Success] New best Dev EER achieved! Saved checkpoint to: {checkpoint_path}")
+            backup_to_drive(checkpoint_path)
+        
+        # Save full training state for crash recovery (EVERY epoch)
+        save_training_checkpoint(epoch, model, optimizer, scheduler, best_eer, is_w2v_frozen, resume_path)
             
     print(f"\n[Finished] Training complete! Best Dev EER: {best_eer:.4f}%")
 
